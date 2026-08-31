@@ -96,8 +96,7 @@ app.post('/auth/login', async (req, res) => {
 app.get('/datos', async (req, res) => {
   try {
     const [usuarios, proveedores, comercializadoras, productos, clientes,
-           contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos,
-           tickets, ticket_notas] = await Promise.all([
+           contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos] = await Promise.all([
       db.sel('usuarios',           '&order=nombre'),
       db.sel('proveedores',        '&order=nombre'),
       db.sel('comercializadoras',  '&order=nombre'),
@@ -109,15 +108,12 @@ app.get('/datos', async (req, res) => {
       db.sel('eventos',            '&order=created_at.desc&limit=100'),
       db.sel('comisiones_usuario'),
       db.sel('crm_ids_proveedor'),
-      db.sel('comision_tramos').catch(() => []),
-      db.sel('tickets',            '&order=created_at.desc').catch(() => []),
-      db.sel('ticket_notas',       '&order=created_at.asc').catch(() => []),
+      db.sel('comision_tramos').catch(() => []),  // tolera que la tabla aún no exista
     ]);
     // Nunca exponer el token al frontend: enviar solo un indicador
     const proveedoresSafe = (proveedores || []).map(({ token, ...p }) => ({ ...p, tiene_token: !!token }));
     res.json({ ok: true, usuarios, proveedores: proveedoresSafe, comercializadoras, productos,
-               clientes, contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos,
-               tickets, ticket_notas });
+               clientes, contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos });
   } catch (e) {
     log('ERROR /datos: ' + e.message);
     res.status(500).json({ error: e.message });
@@ -374,6 +370,15 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           fecha_activacion: ct.fecha_alta || null,
           fecha_renovacion: ct.fecha_vto || null,
           fecha_registro: ct.fecha_reg ? String(ct.fecha_reg).slice(0, 10) : null,
+          // Dirección del punto de suministro
+          calle_cups: ct.calle_cups || ct.calle || '',
+          numero_cups: ct.numero_cups || ct.numero || '',
+          planta_cups: ct.planta_cups || ct.planta || '',
+          puerta_cups: ct.puerta_cups || ct.puerta || '',
+          codpostal_cups: ct.codpostal_cups || ct.codpostal || '',
+          localidad_cups: ct.localidad_cups || ct.localidad || '',
+          provincia_cups: ct.provincia_cups || ct.provincia || '',
+          aclarador_cups: ct.aclarador_cups || ct.aclarador || '',
         };
         // Upsert por id_inergia (único por contrato); si no, por CUPS
         const ex = await db.sel('contratos', '&id_inergia=eq.' + parseInt(ct.id));
@@ -445,7 +450,7 @@ function parseEstadoCtr(data) {
 // Aplica en el CRM el estado que reporta iNergia para un contrato concreto
 // ── Comisión por tramos ───────────────────────────────────────────────────────
 const normTarifa = t => String(t || '').toUpperCase().replace(/[\s.]/g, '').replace('TD', '.0TD').replace('.0.0TD', '.0TD');
-// Devuelve el tramo vigente para un contrato (por consumo kWh/año y, si aplica, potencia P1).
+// Devuelve el tramo vigente para un contrato (por consumo MWh/año y, si aplica, potencia P1).
 // La comisión se lee de ese tramo tal cual (0 es un valor válido, no "pendiente").
 // Devuelve {comision, origen:'tramo'|'producto'} o null solo si aún no puede resolverse (falta consumo con tramos definidos).
 async function calcularComision(ct) {
@@ -492,16 +497,14 @@ async function sincronizarEstadoContrato(ct, pv) {
   let cambio = false;
   if (nuevoEstado && nuevoEstado !== ct.estado) {
     upd.estado = nuevoEstado;
-    upd.estado_at = new Date().toISOString();
     cambio = true;
     if (nuevoEstado === 'activado') {
       upd.fecha_activacion = new Date().toISOString().slice(0,10);
-      const dm = ct.duracion_meses || 12;
-      const d = new Date(); d.setMonth(d.getMonth() + dm);
+      const d = new Date(); d.setMonth(d.getMonth() + 12);
       upd.fecha_renovacion = d.toISOString().slice(0,10);
       upd.fecha_baja = null;
       upd.motivo_rechazo = null;
-      // Si iNergia devuelve el consumo anual y el contrato no lo tiene, capturarlo (kWh/año)
+      // Si iNergia devuelve el consumo anual y el contrato no lo tiene, capturarlo (MWh/año)
       const dd = Array.isArray(data?.data) ? data.data[0] : (data?.data || data || {});
       const consInergia = dd.consumo_anual ?? dd.consumoAnual ?? dd.consumo ?? null;
       if ((ct.consumo_anual === null || ct.consumo_anual === undefined) && consInergia !== null && !isNaN(Number(consInergia))) {
@@ -529,7 +532,6 @@ app.post('/api/inergia/sync-estado/:contratoId', async (req, res) => {
     const ct  = cts?.[0];
     if (!ct)             return res.status(404).json({ error: 'Contrato no encontrado' });
     if (!ct.id_inergia)  return res.status(400).json({ error: 'El contrato no tiene ID de iNergia' });
-    if (ct.no_sync)      return res.status(400).json({ error: 'Este contrato está marcado como "No sincronizar"' });
 
     const cms = await db.sel('comercializadoras', '&id=eq.' + ct.comercializadora_id);
     const pvs = await db.sel('proveedores', '&id=eq.' + cms?.[0]?.proveedor_id);
@@ -556,9 +558,8 @@ app.post('/api/inergia/:proveedor/sync-estados', async (req, res) => {
     if (!cmIds.length) return res.json({ ok: true, revisados: 0, cambios: 0, errores: [] });
 
     const cts = await db.sel('contratos', '&estado=eq.enviado&id_inergia=not.is.null&comercializadora_id=in.(' + cmIds.join(',') + ')');
-    const syncables = (cts || []).filter(c => !c.no_sync);
-    const out = { revisados: 0, cambios: 0, activados: 0, rechazados: 0, excluidos: (cts||[]).length - syncables.length, errores: [] };
-    for (const ct of syncables) {
+    const out = { revisados: 0, cambios: 0, activados: 0, rechazados: 0, errores: [] };
+    for (const ct of (cts || [])) {
       try {
         const r = await sincronizarEstadoContrato(ct, pv);
         out.revisados++;
@@ -572,18 +573,18 @@ app.post('/api/inergia/:proveedor/sync-estados', async (req, res) => {
       } catch (e) { out.errores.push(`CUPS ${ct.cups}: ${e.message}`); }
     }
     await db.ins('eventos', { origen: nombre + ' · iNergia', tipo: 'sync.estados', ref: '—',
-      detalle: `Revisados:${out.revisados} Cambios:${out.cambios} (↑${out.activados} ✕${out.rechazados}) Excluidos:${out.excluidos} Errores:${out.errores.length}` });
+      detalle: `Revisados:${out.revisados} Cambios:${out.cambios} (↑${out.activados} ✕${out.rechazados}) Errores:${out.errores.length}` });
     log(`Sync estados ${nombre}: ${out.revisados} revisados, ${out.cambios} cambios`);
     res.json({ ok: true, ...out });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
 // ── Comisiones por tramos: precarga de RANGOS y edición manual ────────────────
-// Rangos estándar de consumo (kWh/año) por tarifa de acceso. Se precargan a 0 €
+// Rangos estándar de consumo (MWh/año) por tarifa de acceso. Se precargan a 0 €
 // y José va rellenando la comisión a mano conforme llegan las liquidaciones.
-const RANGOS_KWH = {
-  luz: [0,2000,5000,10000,20000,30000,50000,75000,100000,150000,250000,500000],
-  gas: [0,5000,15000,50000,100000,300000,1000000],
+const RANGOS_MWH = {
+  luz: [0,2,5,10,20,30,50,75,100,150,250,500],   // topes; el último tramo es "resto" (hasta=null)
+  gas: [0,5,15,50,100,300,1000],
 };
 // Devuelve [{desde,hasta}] a partir de una lista de topes
 const rangosDe = topes => topes.map((d,i) => ({ desde: d, hasta: i < topes.length-1 ? topes[i+1] : null }));
@@ -603,7 +604,7 @@ app.post('/api/tramos/precargar', async (req, res) => {
       const existentes = await db.sel('comision_tramos', '&producto_id=eq.' + pr.id);
       if (existentes.length && !reset) { saltados++; continue; }
       if (existentes.length && reset) await db.del('comision_tramos', 'producto_id=eq.' + pr.id);
-      const topes = RANGOS_KWH[pr.tipo] || RANGOS_KWH.luz;
+      const topes = RANGOS_MWH[pr.tipo] || RANGOS_MWH.luz;
       const filas = rangosDe(topes).map(r => ({
         producto_id: pr.id, tarifa_acceso: pr.tarifa || null, potencia: null,
         desde: r.desde, hasta: r.hasta, comision: 0,
@@ -787,20 +788,10 @@ app.post('/api/webhooks/gana-energia', async (req, res) => {
     const estadoCRM = mapa[String(est).toLowerCase()];
     if (estadoCRM) {
       const hoy = new Date().toISOString().slice(0,10);
-      const cts = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups));
-      const ct0 = cts?.[0];
-      if (ct0?.no_sync) {
-        await db.ins('eventos', { origen:'Gana Energía (webhook)', tipo:'sync.excluido', ref:cups, detalle:'Contrato marcado no_sync, ignorado' });
-      } else {
-        const upd = { estado: estadoCRM, estado_at: new Date().toISOString() };
-        if (estadoCRM==='activado') {
-          upd.fecha_activacion=hoy;
-          const dm = ct0?.duracion_meses || 12;
-          const d=new Date(); d.setMonth(d.getMonth()+dm); upd.fecha_renovacion=d.toISOString().slice(0,10);
-        }
-        if (estadoCRM==='baja') upd.fecha_baja=hoy;
-        await db.upd('contratos', 'cups=eq.' + encodeURIComponent(cups), upd);
-      }
+      const upd = { estado: estadoCRM };
+      if (estadoCRM==='activado') { upd.fecha_activacion=hoy; const d=new Date(); d.setMonth(d.getMonth()+12); upd.fecha_renovacion=d.toISOString().slice(0,10); }
+      if (estadoCRM==='baja')     upd.fecha_baja=hoy;
+      await db.upd('contratos', 'cups=eq.' + encodeURIComponent(cups), upd);
     }
   }
   await db.ins('eventos', { origen:'Gana Energía (webhook)', tipo:ev.tipo||'evento', ref:cups||'—', detalle:JSON.stringify(ev).slice(0,200) });
