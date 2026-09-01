@@ -96,7 +96,8 @@ app.post('/auth/login', async (req, res) => {
 app.get('/datos', async (req, res) => {
   try {
     const [usuarios, proveedores, comercializadoras, productos, clientes,
-           contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos] = await Promise.all([
+           contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos,
+           tickets, ticket_notas, canales] = await Promise.all([
       db.sel('usuarios',           '&order=nombre'),
       db.sel('proveedores',        '&order=nombre'),
       db.sel('comercializadoras',  '&order=nombre'),
@@ -108,12 +109,16 @@ app.get('/datos', async (req, res) => {
       db.sel('eventos',            '&order=created_at.desc&limit=100'),
       db.sel('comisiones_usuario'),
       db.sel('crm_ids_proveedor'),
-      db.sel('comision_tramos').catch(() => []),  // tolera que la tabla aún no exista
+      db.sel('comision_tramos').catch(() => []),
+      db.sel('tickets',            '&order=created_at.desc').catch(() => []),
+      db.sel('ticket_notas',       '&order=created_at.asc').catch(() => []),
+      db.sel('canales',            '&order=nombre').catch(() => []),
     ]);
     // Nunca exponer el token al frontend: enviar solo un indicador
     const proveedoresSafe = (proveedores || []).map(({ token, ...p }) => ({ ...p, tiene_token: !!token }));
     res.json({ ok: true, usuarios, proveedores: proveedoresSafe, comercializadoras, productos,
-               clientes, contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos });
+               clientes, contratos, liquidaciones, lineas, eventos, comisiones, crm_ids, comision_tramos,
+               tickets, ticket_notas, canales });
   } catch (e) {
     log('ERROR /datos: ' + e.message);
     res.status(500).json({ error: e.message });
