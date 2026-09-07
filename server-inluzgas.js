@@ -343,7 +343,16 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
       // Endesa la gestiona SALUTARIS: al sincronizar ALFER, saltar Endesa para no duplicar
       if (nombre === 'ALFER' && /endesa/i.test(cm.nombre)) continue;
       const { data } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int });
-      const cartera = data?.data || [];
+      let cartera = data?.data || [];
+      // Paginación: si la API devuelve exactamente 300, puede haber más páginas
+      let pagina = 2;
+      while (cartera.length > 0 && cartera.length % 300 === 0) {
+        const { data: nextPage } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int, pagina });
+        const nextData = nextPage?.data || [];
+        if (nextData.length === 0) break;
+        cartera = cartera.concat(nextData);
+        pagina++;
+      }
       for (const ct of cartera) {
         total++;
         if (ESTADOS_NO_VIGENTES.includes(ct.estado)) { saltados_novigente++; continue; }
