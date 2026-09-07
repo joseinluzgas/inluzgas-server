@@ -344,14 +344,23 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
       if (nombre === 'ALFER' && /endesa/i.test(cm.nombre)) continue;
       const { data } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int });
       let cartera = data?.data || [];
-      // Paginación: si la API devuelve exactamente 300, puede haber más páginas
-      let pagina = 2;
-      while (cartera.length > 0 && cartera.length % 300 === 0) {
-        const { data: nextPage } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int, pagina });
-        const nextData = nextPage?.data || [];
-        if (nextData.length === 0) break;
-        cartera = cartera.concat(nextData);
-        pagina++;
+      // Si devuelve exactamente 300, intentar pedir más con paginación
+      if (cartera.length === 300) {
+        try {
+          // Intentar con parámetro 'pagina'
+          const { data: p2 } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int, pagina: 2 });
+          const next = p2?.data || [];
+          if (next.length > 0 && next[0]?.cups !== cartera[0]?.cups) {
+            cartera = cartera.concat(next);
+            log('Paginación cartera ' + cm.nombre + ': página 2 → +' + next.length + ' contratos');
+            // Página 3 si sigue dando 300
+            if (next.length === 300) {
+              const { data: p3 } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int, pagina: 3 });
+              const n3 = p3?.data || [];
+              if (n3.length > 0 && n3[0]?.cups !== next[0]?.cups) cartera = cartera.concat(n3);
+            }
+          }
+        } catch (e) { log('Paginación no soportada para ' + cm.nombre + ': ' + e.message); }
       }
       for (const ct of cartera) {
         total++;
