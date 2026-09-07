@@ -319,6 +319,20 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
     // Comercial por defecto para clientes nuevos: Laura, o el primer usuario disponible
     const usuarios = await db.sel('usuarios');
     const comercialDefecto = (usuarios.find(u => /laura/i.test(u.nombre)) || usuarios[0])?.id;
+    // Índice de comerciales por nombre normalizado
+    const normNom = s => String(s || '').toUpperCase().replace(/[^A-Z]/g, '');
+    const userPorNombre = new Map();
+    for (const u of usuarios) { userPorNombre.set(normNom(u.nombre), u.id); }
+    function resolverComercial(nombreComercial) {
+      if (!nombreComercial) return comercialDefecto;
+      const n = normNom(nombreComercial);
+      if (userPorNombre.has(n)) return userPorNombre.get(n);
+      // Match parcial: buscar si algún usuario contiene el nombre o viceversa
+      for (const [key, uid] of userPorNombre) {
+        if (key.includes(n) || n.includes(key)) return uid;
+      }
+      return comercialDefecto;
+    }
 
     let creados = 0, actualizados = 0, saltados_novigente = 0, clientes_creados = 0, total = 0;
     const sinIdentificador = [];
@@ -339,7 +353,8 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         if (!cliId) {
           // Cliente no existe: crearlo desde los datos de la cartera
           try {
-            const nuevo = clienteDesdeCartera(ct, comercialDefecto);
+            const comercialId = resolverComercial(ct.comercial);
+            const nuevo = clienteDesdeCartera(ct, comercialId);
             const ins = await db.ins('clientes', nuevo);
             cliId = Array.isArray(ins) ? ins[0]?.id : ins?.id;
             if (cliId) { cliPorId.set(claveCli, cliId); clientes_creados++; }
@@ -353,6 +368,9 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         let prodId = ct.idproducto ? prodPorInergia.get(String(ct.idproducto)) : null;
         if (!prodId) prodId = sinEspPorCm.get(cm.id);
         if (!prodId) continue; // no debería pasar si existe el SIN ESPECIFICAR
+
+        // Resolver comercial por nombre de iNergia
+        const comercialId = resolverComercial(ct.comercial);
 
         const fila = {
           cliente_id: cliId,
@@ -387,10 +405,17 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         };
         // Upsert por id_inergia (único por contrato); si no, por CUPS
         const ex = await db.sel('contratos', '&id_inergia=eq.' + parseInt(ct.id));
-        if (ex?.length) { await db.upd('contratos', 'id=eq.' + ex[0].id, fila); actualizados++; }
+        if (ex?.length) {
+          if (!ex[0].no_sync) { await db.upd('contratos', 'id=eq.' + ex[0].id, fila); actualizados++; }
+          // Actualizar comercial del cliente si iNergia trae nombre
+          if (ct.comercial && cliId) await db.upd('clientes', 'id=eq.' + cliId, { comercial_id: comercialId }).catch(() => {});
+        }
         else {
           const exCups = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(ct.cups));
-          if (exCups?.length) { await db.upd('contratos', 'id=eq.' + exCups[0].id, fila); actualizados++; }
+          if (exCups?.length) {
+            if (!exCups[0].no_sync) { await db.upd('contratos', 'id=eq.' + exCups[0].id, fila); actualizados++; }
+            if (ct.comercial && cliId) await db.upd('clientes', 'id=eq.' + cliId, { comercial_id: comercialId }).catch(() => {});
+          }
           else { await db.ins('contratos', fila); creados++; }
         }
       }
