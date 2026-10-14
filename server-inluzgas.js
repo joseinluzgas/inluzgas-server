@@ -406,6 +406,9 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           permanencia: ct.permanencia === '1' ? 'SI' : 'NO',
           renovacion_auto: 'NO',
           tiposol: ct.tipo_solicitud || 'IMPORTADO API',
+          // Dato informativo del proveedor. La cartera real se asigna desde Excel
+          // o manualmente y nunca se sobrescribe durante una sincronizacion.
+          comercial_import: ct.comercial ? String(ct.comercial).trim() : null,
           id_inergia: parseInt(ct.id) || null,
           iban: ct.iban || '',
           fecha_activacion: ct.fecha_alta || null,
@@ -425,14 +428,13 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         const ex = await db.sel('contratos', '&id_inergia=eq.' + parseInt(ct.id));
         if (ex?.length) {
           if (!ex[0].no_sync) { await db.upd('contratos', 'id=eq.' + ex[0].id, fila); actualizados++; }
-          // Actualizar comercial del cliente si iNergia trae nombre
-          if (ct.comercial && cliId) await db.upd('clientes', 'id=eq.' + cliId, { comercial_id: comercialId }).catch(() => {});
+          else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + ex[0].id, { comercial_import: fila.comercial_import });
         }
         else {
           const exCups = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(ct.cups));
           if (exCups?.length) {
             if (!exCups[0].no_sync) { await db.upd('contratos', 'id=eq.' + exCups[0].id, fila); actualizados++; }
-            if (ct.comercial && cliId) await db.upd('clientes', 'id=eq.' + cliId, { comercial_id: comercialId }).catch(() => {});
+            else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + exCups[0].id, { comercial_import: fila.comercial_import });
           }
           else { await db.ins('contratos', fila); creados++; }
         }
@@ -559,7 +561,7 @@ async function sincronizarEstadoContrato(ct, pv) {
         upd.consumo_anual = Number(consInergia);
       }
       // Comisión-foto: se fija al activar; si falta el consumo queda pendiente (null)
-      if (ct.comision_calculada === null || ct.comision_calculada === undefined) {
+      if (ct.comercial_cartera_id && (ct.comision_calculada === null || ct.comision_calculada === undefined)) {
         const res = await calcularComision({ ...ct, ...upd });
         if (res) upd.comision_calculada = res.comision;
       }
@@ -754,7 +756,14 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
 
   const comerMap = {}; (comerList||[]).forEach(cm => { comerMap[cm.nombre.toUpperCase()] = cm.id; });
   const prodMap  = {}; (prodList||[]).forEach(p  => { prodMap[p.nombre?.toUpperCase()]   = p; });
-  const userMap  = {}; (userList||[]).forEach(u  => { userMap[u.nombre.toUpperCase()]    = u.id; });
+  const normComercial = s => String(s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase().replace(/[^A-Z]/g,'');
+  const resolverComercialExcel = nombre => {
+    const n = normComercial(nombre);
+    if (!n) return null;
+    const exacto = (userList||[]).find(u => normComercial(u.nombre) === n);
+    if (exacto) return exacto.id;
+    return (userList||[]).find(u => normComercial(u.nombre).includes(n) || n.includes(normComercial(u.nombre)))?.id || null;
+  };
 
   for (const f of filas) {
     try {
@@ -770,7 +779,7 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
       } else {
         const primerChar  = cif[0];
         const tipoTitular = /^[PQ]/i.test(primerChar) ? 'organismo' : /^[ABCDEFGHJNRSUVW]/i.test(primerChar) ? 'empresa' : 'fisica';
-        const comercialId = userMap[String(f.comercial||'').toUpperCase().trim()] || userList?.[0]?.id;
+        const comercialId = resolverComercialExcel(f.comercial) || userList?.[0]?.id;
         const cl = await db.ins('clientes', { cif, razon_social: nombre, tipo_titular: tipoTitular, telefono: String(f.telefono||''), email: String(f.email||''), comercial_id: comercialId, creado_por: comercialId });
         clienteId = cl?.[0]?.id;
       }
@@ -793,8 +802,11 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
       const cups   = String(f.cups||'').trim();
       const hoy    = new Date().toISOString().slice(0,10);
 
+      const comercialCarteraId = resolverComercialExcel(f.comercial);
       const ctData = {
         cliente_id: clienteId, cups, tipo: prod?.tipo || (cups.startsWith('ES02')?'gas':'luz'),
+        comercial_cartera_id: comercialCarteraId,
+        comercial_import: String(f.comercial_import||'').trim() || null,
         comercializadora_id: comercializadoraId, producto_id: productoId,
         estado, tarifa: String(f.tarifa||''),
         permanencia: f.perm==='SI'?'SI':'NO', renovacion_auto: f.ren==='SI'?'SI':'NO',
