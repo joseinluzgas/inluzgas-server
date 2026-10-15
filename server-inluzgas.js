@@ -64,6 +64,25 @@ const db = {
 
 const log = (msg) => { console.log(`[${new Date().toLocaleTimeString('es-ES')}] ${msg}`); };
 
+// Cuando un CUPS tiene varias contrataciones, la más reciente es la actual y
+// las anteriores se conservan como histórico. Nunca se actualiza en bloque el
+// histórico completo por una notificación del suministro.
+const fechaContrato = ct => {
+  // La versión la determina la fecha de origen del contrato, no una baja o
+  // sincronización posterior que podría hacer parecer nuevo a un histórico.
+  const valor = [ct.fecha_registro, ct.fecha_activacion, ct.fecha_envio, ct.created_at, ct.estado_at, ct.fecha_baja].find(Boolean);
+  if (!valor) return 0;
+  const fecha = Date.parse(String(valor).length === 10 ? valor + 'T00:00:00' : valor);
+  return Number.isFinite(fecha) ? fecha : 0;
+};
+const contratoActual = lista => [...(lista || [])].sort((a, b) => {
+  const porFecha = fechaContrato(b) - fechaContrato(a);
+  if (porFecha) return porFecha;
+  const ca = Number(a.codigo || a.id_inergia || 0), cb = Number(b.codigo || b.id_inergia || 0);
+  if (Number.isFinite(ca) && Number.isFinite(cb) && ca !== cb) return cb - ca;
+  return String(b.id || '').localeCompare(String(a.id || ''));
+})[0] || null;
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // AUTH — login / logout / sesión
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -432,9 +451,10 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         }
         else {
           const exCups = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(ct.cups));
-          if (exCups?.length) {
-            if (!exCups[0].no_sync) { await db.upd('contratos', 'id=eq.' + exCups[0].id, fila); actualizados++; }
-            else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + exCups[0].id, { comercial_import: fila.comercial_import });
+          const exActual = contratoActual(exCups);
+          if (exActual) {
+            if (!exActual.no_sync) { await db.upd('contratos', 'id=eq.' + exActual.id, fila); actualizados++; }
+            else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + exActual.id, { comercial_import: fila.comercial_import });
           }
           else { await db.ins('contratos', fila); creados++; }
         }
@@ -819,9 +839,22 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
         pagador: parseInt(f.pag)||1, tiposol:'C1',
       };
 
-      const ctEx = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups));
-      if (ctEx?.length) { await db.upd('contratos', 'id=eq.' + ctEx[0].id, ctData); resultados.actualizados++; }
-      else              { await db.ins('contratos', ctData); resultados.creados++; }
+      const referencia = String(f.codigo || '').trim();
+      const ctMismoOrigen = referencia
+        ? contratoActual(await db.sel('contratos', '&referencia=eq.' + encodeURIComponent(referencia) + '&comercializadora_id=eq.' + comercializadoraId))
+        : null;
+      if (ctMismoOrigen) {
+        await db.upd('contratos', 'id=eq.' + ctMismoOrigen.id, ctData);
+        resultados.actualizados++;
+      } else if (referencia) {
+        // Mismo CUPS con otro código = nueva contratación; la anterior queda en histórico.
+        await db.ins('contratos', ctData);
+        resultados.creados++;
+      } else {
+        const ctActual = contratoActual(await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups)));
+        if (ctActual) { await db.upd('contratos', 'id=eq.' + ctActual.id, ctData); resultados.actualizados++; }
+        else          { await db.ins('contratos', ctData); resultados.creados++; }
+      }
     } catch (e) {
       resultados.errores.push('Error en CUPS ' + f.cups + ': ' + e.message);
     }
@@ -851,7 +884,9 @@ app.post('/api/webhooks/gana-energia', async (req, res) => {
       const upd = { estado: estadoCRM };
       if (estadoCRM==='activado') { upd.fecha_activacion=hoy; const d=new Date(); d.setMonth(d.getMonth()+12); upd.fecha_renovacion=d.toISOString().slice(0,10); }
       if (estadoCRM==='baja')     upd.fecha_baja=hoy;
-      await db.upd('contratos', 'cups=eq.' + encodeURIComponent(cups), upd);
+      const versiones = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups));
+      const actual = contratoActual(versiones);
+      if (actual && !actual.no_sync) await db.upd('contratos', 'id=eq.' + actual.id, upd);
     }
   }
   await db.ins('eventos', { origen:'Gana Energía (webhook)', tipo:ev.tipo||'evento', ref:cups||'—', detalle:JSON.stringify(ev).slice(0,200) });
