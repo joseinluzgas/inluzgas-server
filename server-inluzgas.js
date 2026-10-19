@@ -882,18 +882,43 @@ app.post('/api/webhooks/gana-energia', async (req, res) => {
   }
   const ev   = req.body;
   const cups = ev.cups || ev.CUPS;
-  const est  = ev.estado || ev.Estado;
-  if (cups && est) {
-    const mapa = { activado:'activado', activo:'activado', baja:'baja', rechazado:'rechazado' };
-    const estadoCRM = mapa[String(est).toLowerCase()];
-    if (estadoCRM) {
+  const estadoPayload = ev.estado || ev.Estado;
+  const estadoGana = typeof estadoPayload === 'object'
+    ? estadoPayload?.nombre || estadoPayload?.name || ''
+    : String(estadoPayload || '');
+  if (cups && estadoGana) {
+    const normalizado = estadoGana.trim().toLowerCase();
+    let estadoCRM = null;
+    if (normalizado === 'activo' || normalizado === 'activado') estadoCRM = 'activado';
+    else if (normalizado.startsWith('baja')) estadoCRM = 'baja';
+    else if (normalizado.startsWith('rechaz')) estadoCRM = 'rechazado';
+    else if (normalizado.startsWith('cancel')) estadoCRM = 'cancelado';
+    else if (normalizado.includes('incidencia')) estadoCRM = 'incidencia';
+    else if (/firmado|tramitado|aceptado|revisado|solicitud pendiente/.test(normalizado)) estadoCRM = 'en_tramite';
+
+    const ganaCms = await db.sel('comercializadoras', '&nombre=eq.GANA');
+    const ganaCmIds = new Set((ganaCms || []).map(cm => cm.id));
+    const versiones = (await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups)))
+      .filter(c => ganaCmIds.has(c.comercializadora_id));
+    const actual = contratoActual(versiones);
+    if (actual && !actual.no_sync) {
       const hoy = new Date().toISOString().slice(0,10);
-      const upd = { estado: estadoCRM };
-      if (estadoCRM==='activado') { upd.fecha_activacion=hoy; const d=new Date(); d.setMonth(d.getMonth()+12); upd.fecha_renovacion=d.toISOString().slice(0,10); }
-      if (estadoCRM==='baja')     upd.fecha_baja=hoy;
-      const versiones = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups));
-      const actual = contratoActual(versiones);
-      if (actual && !actual.no_sync) await db.upd('contratos', 'id=eq.' + actual.id, upd);
+      const upd = { estado_proveedor: estadoGana, ultima_consulta_estado: new Date().toISOString() };
+      if (estadoCRM) upd.estado = estadoCRM;
+      // Una repetición del webhook nunca debe desplazar una fecha ya conocida.
+      if (estadoCRM === 'activado' && !actual.fecha_activacion) {
+        const fechaActivacion = ev.fecha_activacion || ev.fechaAlta || ev.fecha_alta || hoy;
+        upd.fecha_activacion = String(fechaActivacion).slice(0, 10);
+        if (!actual.fecha_renovacion) {
+          const d = new Date(upd.fecha_activacion + 'T00:00:00');
+          d.setMonth(d.getMonth() + (Number(actual.duracion_meses) || 12));
+          upd.fecha_renovacion = d.toISOString().slice(0, 10);
+        }
+      }
+      if (estadoCRM === 'baja' && !actual.fecha_baja) {
+        upd.fecha_baja = String(ev.fecha_baja || ev.fechaBaja || hoy).slice(0, 10);
+      }
+      await db.upd('contratos', 'id=eq.' + actual.id, upd);
     }
   }
   await db.ins('eventos', { origen:'Gana Energía (webhook)', tipo:ev.tipo||'evento', ref:cups||'—', detalle:JSON.stringify(ev).slice(0,200) });
