@@ -319,6 +319,7 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
     // Comercializadoras de este proveedor con su id_inergia_int
     const cms = await db.sel('comercializadoras', '&proveedor_id=eq.' + pv.id);
     if (!cms?.length) return res.status(400).json({ error: 'El proveedor no tiene comercializadoras sincronizadas. Sincroniza el catálogo primero.' });
+    const cmIdsProveedor = new Set(cms.map(cm => cm.id));
 
     // Índices para cruce: clientes por CIF/NIF normalizado, productos por id_inergia_int
     const norm = s => String(s || '').toUpperCase().replace(/[\s.\-]/g, '');
@@ -444,13 +445,19 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           aclarador_cups: ct.aclarador_cups || ct.aclarador || '',
         };
         // Upsert por id_inergia (único por contrato); si no, por CUPS
-        const ex = await db.sel('contratos', '&id_inergia=eq.' + parseInt(ct.id));
-        if (ex?.length) {
-          if (!ex[0].no_sync) { await db.upd('contratos', 'id=eq.' + ex[0].id, fila); actualizados++; }
-          else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + ex[0].id, { comercial_import: fila.comercial_import });
+        // Los identificadores y CUPS pueden coincidir entre proveedores. Una
+        // sincronización de iNergia solo puede modificar contratos de las
+        // comercializadoras vinculadas al proveedor que se está consultando.
+        const ex = (await db.sel('contratos', '&id_inergia=eq.' + parseInt(ct.id)))
+          .filter(c => cmIdsProveedor.has(c.comercializadora_id));
+        const exPorId = contratoActual(ex);
+        if (exPorId) {
+          if (!exPorId.no_sync) { await db.upd('contratos', 'id=eq.' + exPorId.id, fila); actualizados++; }
+          else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + exPorId.id, { comercial_import: fila.comercial_import });
         }
         else {
-          const exCups = await db.sel('contratos', '&cups=eq.' + encodeURIComponent(ct.cups));
+          const exCups = (await db.sel('contratos', '&cups=eq.' + encodeURIComponent(ct.cups)))
+            .filter(c => cmIdsProveedor.has(c.comercializadora_id));
           const exActual = contratoActual(exCups);
           if (exActual) {
             if (!exActual.no_sync) { await db.upd('contratos', 'id=eq.' + exActual.id, fila); actualizados++; }
