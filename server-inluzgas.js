@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
+const { normalizarEstadoCRM, coincidirContratoAPI, camposEstadoAPI } = require('./estados-inergia.cjs');
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -66,22 +67,6 @@ const log = (msg) => { console.log(`[${new Date().toLocaleTimeString('es-ES')}] 
 
 // El CRM guarda un catálogo corto y estable. El texto literal del proveedor
 // se conserva aparte en estado_proveedor y, cuando aporta detalle, en situacion.
-const normalizarEstadoCRM = (valor, fallback = 'en_tramite') => {
-  const t = String(valor || '').trim().toLowerCase();
-  if (!t) return fallback;
-  if (/pdte\.?\s*renovar|pendiente.*renovar/.test(t)) return 'pdte_renovar';
-  if (/pdte\.?\s*grabar|pendiente.*grabar/.test(t)) return 'pdte_grabar';
-  if (/^activ/.test(t)) return 'activado';
-  if (/^baja/.test(t)) return 'baja';
-  if (/cancel|anulad/.test(t)) return 'cancelado';
-  if (/rechaz/.test(t)) return 'rechazado';
-  if (/incidencia resuelta/.test(t)) return 'en_tramite';
-  if (/incidenc/.test(t)) return 'incidencia';
-  if (/borrador/.test(t)) return 'borrador';
-  if (/enviado/.test(t)) return 'enviado';
-  if (/tr[aá]mite|pendiente|firma|nuevo|aceptado|revisado|solicitud/.test(t)) return 'en_tramite';
-  return fallback;
-};
 
 // Cuando un CUPS tiene varias contrataciones, la más reciente es la actual y
 // las anteriores se conservan como histórico. Nunca se actualiza en bloque el
@@ -277,7 +262,6 @@ app.post('/api/inergia/:proveedor/sincronizar-catalogo', async (req, res) => {
 // cada contrato VIGENTE (fuera Baja/Baja CC/Cancelado/Rechazado) cruzando cliente
 // por CIF/NIF y producto por idproducto. El id del contrato en iNergia se guarda
 // en id_inergia, dejando la sincronización de estados lista.
-const ESTADOS_NO_VIGENTES = ['Baja', 'Baja CC', 'Cancelado', 'Rechazado'];
 // Deduce tipo de titular por la primera letra del identificador
 function tipoTitular(id) {
   const c = String(id || '').trim().charAt(0).toUpperCase();
@@ -338,7 +322,6 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
     // Comercializadoras de este proveedor con su id_inergia_int
     const cms = await db.sel('comercializadoras', '&proveedor_id=eq.' + pv.id);
     if (!cms?.length) return res.status(400).json({ error: 'El proveedor no tiene comercializadoras sincronizadas. Sincroniza el catálogo primero.' });
-    const cmIdsProveedor = new Set(cms.map(cm => cm.id));
 
     // Índices para cruce: clientes por CIF/NIF normalizado, productos por id_inergia_int
     const norm = s => String(s || '').toUpperCase().replace(/[\s.\-]/g, '');
@@ -401,9 +384,14 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           }
         } catch (e) { log('Paginación no soportada para ' + cm.nombre + ': ' + e.message); }
       }
+      const candidatos = await db.sel('contratos', '&comercializadora_id=eq.' + cm.id);
       for (const ct of cartera) {
         total++;
-        if (ESTADOS_NO_VIGENTES.includes(ct.estado)) { saltados_novigente++; continue; }
+        const estadoAPI = normalizarEstadoCRM(ct.estado);
+        if (!estadoAPI) {
+          if (erroresCli.length < 50) erroresCli.push({ cups: ct.cups, motivo: 'Estado API desconocido; contrato conservado' });
+          continue;
+        }
         const claveCli = norm(ct.cif);
         if (!claveCli) { if (sinIdentificador.length < 100) sinIdentificador.push({ nombre: ct.nombre, cups: ct.cups }); continue; }
         let cliId = cliPorId.get(claveCli);
@@ -435,7 +423,7 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           tipo: ct.suministro === 'GAS' ? 'gas' : 'luz',
           comercializadora_id: cm.id,
           producto_id: prodId,
-          estado: normalizarEstadoCRM(ct.estado, 'activado'),
+          estado: estadoAPI,
           estado_proveedor: ct.estado || null,
           situacion: ct.situacion || ct.estado || '',
           codigo: ct.codigo || '',
@@ -454,6 +442,7 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           fecha_activacion: ct.fecha_alta || null,
           fecha_renovacion: ct.fecha_vto || null,
           fecha_registro: ct.fecha_reg ? String(ct.fecha_reg).slice(0, 10) : null,
+          fecha_baja: ct.fecha_baja || null,
           // Dirección del punto de suministro
           calle_cups: ct.calle_cups || ct.calle || '',
           numero_cups: ct.numero_cups || ct.numero || '',
@@ -464,26 +453,26 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           provincia_cups: ct.provincia_cups || ct.provincia || '',
           aclarador_cups: ct.aclarador_cups || ct.aclarador || '',
         };
-        // Upsert por id_inergia (único por contrato); si no, por CUPS
-        // Los identificadores y CUPS pueden coincidir entre proveedores. Una
-        // sincronización de iNergia solo puede modificar contratos de las
-        // comercializadoras vinculadas al proveedor que se está consultando.
-        const ex = (await db.sel('contratos', '&id_inergia=eq.' + parseInt(ct.id)))
-          .filter(c => cmIdsProveedor.has(c.comercializadora_id));
-        const exPorId = contratoActual(ex);
-        if (exPorId) {
-          if (!exPorId.no_sync) { await db.upd('contratos', 'id=eq.' + exPorId.id, fila); actualizados++; }
-          else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + exPorId.id, { comercial_import: fila.comercial_import });
-        }
-        else {
-          const exCups = (await db.sel('contratos', '&cups=eq.' + encodeURIComponent(ct.cups)))
-            .filter(c => cmIdsProveedor.has(c.comercializadora_id));
-          const exActual = contratoActual(exCups);
-          if (exActual) {
-            if (!exActual.no_sync) { await db.upd('contratos', 'id=eq.' + exActual.id, fila); actualizados++; }
-            else if (fila.comercial_import) await db.upd('contratos', 'id=eq.' + exActual.id, { comercial_import: fila.comercial_import });
+        const coincidencias = candidatos.filter(c => coincidirContratoAPI(c, clientes.find(cl => cl.id === c.cliente_id), [ct]));
+        if (coincidencias.length === 1) {
+          const existente = coincidencias[0];
+          if (!existente.no_sync) {
+            // Preserve cartera enrichment only after identifying the exact
+            // contracting instance; never repurpose history for a renewal.
+            const estadoData = { ...fila, ...camposEstadoAPI(existente, ct), id_inergia: Number(ct.id) };
+            await db.upd('contratos', 'id=eq.' + existente.id + '&no_sync=not.is.true', estadoData);
+            actualizados++;
           }
-          else { await db.ins('contratos', fila); creados++; }
+        } else if (coincidencias.length > 1) {
+          if (erroresCli.length < 50) erroresCli.push({ cups: ct.cups, motivo: 'Varias contrataciones coincidentes; revisar duplicados' });
+        } else if (candidatos.some(c => c.id_inergia && String(c.id_inergia) === String(ct.id))) {
+          if (erroresCli.length < 50) erroresCli.push({ cups: ct.cups, motivo: 'ID API con identidad o fecha incompatible; contrato conservado' });
+        } else if (['baja','cancelado','rechazado'].includes(estadoAPI)) {
+          saltados_novigente++;
+        } else {
+          const nuevos = await db.ins('contratos', fila);
+          candidatos.push(...(Array.isArray(nuevos) ? nuevos : [nuevos]));
+          creados++;
         }
       }
     }
@@ -526,18 +515,12 @@ app.get('/api/inergia/:proveedor/estadoctr/:id', async (req, res) => {
 
 // ── Sincronización de estados desde iNergia ───────────────────────────────────
 // Mapea el texto de estado que devuelve iNergia al estado del CRM.
-// Devuelve null si no procede cambiar nada (en trámite / desconocido).
+// Un estado desconocido conserva el dato existente y requiere revisión.
 function mapEstadoInergia(txt) {
   return normalizarEstadoCRM(txt, null);
 }
 
 // Extrae estado y motivo del JSON de estadoctr sea cual sea su envoltorio
-function parseEstadoCtr(data) {
-  const d = Array.isArray(data?.data) ? data.data[0] : (data?.data || data || {});
-  const estadoTxt = d.estado ?? d.Estado ?? d.estado_contrato ?? d.status ?? '';
-  const motivo    = d.motivo ?? d.Motivo ?? d.observaciones ?? d.Observaciones ?? d.incidencia ?? d.comentario ?? '';
-  return { estadoTxt: String(estadoTxt), motivo: String(motivo) };
-}
 
 // Aplica en el CRM el estado que reporta iNergia para un contrato concreto
 // ── Comisión por tramos ───────────────────────────────────────────────────────
@@ -580,22 +563,25 @@ async function calcularComision(ct) {
 }
 
 async function sincronizarEstadoContrato(ct, pv) {
-  const { status, data } = await getquery(pv.token, { query: 'estadoctr', idcontrato: ct.id_inergia });
+  if (ct.no_sync) return { cambio: false, protegido: true, estadoTxt: ct.estado_proveedor, nuevoEstado: ct.estado, motivo: '' };
+  const cm = (await db.sel('comercializadoras', '&id=eq.' + ct.comercializadora_id))?.[0];
+  const cliente = (await db.sel('clientes', '&id=eq.' + ct.cliente_id))?.[0];
+  if (cm?.proveedor_id !== pv.id || cm.id_inergia_int == null) throw new Error('Comercializadora sin identificación API');
+  const { status, data: cartera } = await getquery(pv.token, { query: 'cartera', idcomercializadora: cm.id_inergia_int });
   if (status < 200 || status >= 300) throw new Error('iNergia respondió ' + status);
-  const { estadoTxt, motivo } = parseEstadoCtr(data);
+  const detalle = coincidirContratoAPI(ct, cliente, cartera?.data || []);
+  if (!detalle) throw new Error('Sin coincidencia inequívoca en la API; contrato conservado');
+  const data = { data: detalle };
+  const estadoTxt = String(detalle.estado || ''), motivo = String(detalle.situacion || '');
   const nuevoEstado = mapEstadoInergia(estadoTxt);
-
-  const upd = { estado_proveedor: estadoTxt || null, ultima_consulta_estado: new Date().toISOString() };
-  if (motivo || (!ct.situacion && estadoTxt)) upd.situacion = motivo || estadoTxt;
+  if (!nuevoEstado) throw new Error('Estado de iNergia vacío o desconocido; contrato conservado');
+  const upd = camposEstadoAPI(ct, { ...detalle, estado: estadoTxt, situacion: detalle.situacion ?? motivo });
+  upd.id_inergia = Number(detalle.id);
   let cambio = false;
   if (nuevoEstado && nuevoEstado !== ct.estado) {
     upd.estado = nuevoEstado;
     cambio = true;
     if (nuevoEstado === 'activado') {
-      upd.fecha_activacion = new Date().toISOString().slice(0,10);
-      const d = new Date(); d.setMonth(d.getMonth() + 12);
-      upd.fecha_renovacion = d.toISOString().slice(0,10);
-      upd.fecha_baja = null;
       upd.motivo_rechazo = null;
       // Si iNergia devuelve el consumo anual y el contrato no lo tiene, capturarlo (MWh/año)
       const dd = Array.isArray(data?.data) ? data.data[0] : (data?.data || data || {});
@@ -610,11 +596,10 @@ async function sincronizarEstadoContrato(ct, pv) {
       }
     }
     if (nuevoEstado === 'rechazado') upd.motivo_rechazo = motivo || estadoTxt || 'Sin motivo indicado';
-    if (nuevoEstado === 'baja')      upd.fecha_baja = new Date().toISOString().slice(0,10);
   } else if (nuevoEstado === 'rechazado' && motivo && motivo !== ct.motivo_rechazo) {
     upd.motivo_rechazo = motivo; // actualizar motivo aunque ya estuviera rechazado
   }
-  await db.upd('contratos', 'id=eq.' + ct.id, upd);
+  await db.upd('contratos', 'id=eq.' + ct.id + '&no_sync=not.is.true', upd);
   return { cambio, estadoTxt, nuevoEstado, motivo };
 }
 
@@ -624,7 +609,7 @@ app.post('/api/inergia/sync-estado/:contratoId', async (req, res) => {
     const cts = await db.sel('contratos', '&id=eq.' + req.params.contratoId);
     const ct  = cts?.[0];
     if (!ct)             return res.status(404).json({ error: 'Contrato no encontrado' });
-    if (!ct.id_inergia)  return res.status(400).json({ error: 'El contrato no tiene ID de iNergia' });
+    if (ct.no_sync) return res.json({ ok: true, cambio: false, protegido: true, estadoTxt: ct.estado_proveedor });
 
     const cms = await db.sel('comercializadoras', '&id=eq.' + ct.comercializadora_id);
     const pvs = await db.sel('proveedores', '&id=eq.' + cms?.[0]?.proveedor_id);
@@ -641,7 +626,8 @@ app.post('/api/inergia/sync-estado/:contratoId', async (req, res) => {
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 
-// Consulta y actualiza TODOS los contratos enviados de un proveedor
+// Revisa todos los estados, incluidos los históricos, contra la cartera API.
+// Una coincidencia requiere ID o titular+CUPS+fecha dentro de la comercializadora.
 app.post('/api/inergia/:proveedor/sync-estados', async (req, res) => {
   const nombre = req.params.proveedor.toUpperCase();
   try {
@@ -650,11 +636,42 @@ app.post('/api/inergia/:proveedor/sync-estados', async (req, res) => {
     const cmIds = (cms || []).map(c => c.id);
     if (!cmIds.length) return res.json({ ok: true, revisados: 0, cambios: 0, errores: [] });
 
-    const cts = await db.sel('contratos', '&estado=eq.enviado&id_inergia=not.is.null&comercializadora_id=in.(' + cmIds.join(',') + ')');
-    const out = { revisados: 0, cambios: 0, activados: 0, rechazados: 0, errores: [] };
-    for (const ct of (cts || [])) {
+    const cts = await db.sel('contratos', '&comercializadora_id=in.(' + cmIds.join(',') + ')');
+    const clientes = new Map((await db.sel('clientes')).map(c => [c.id,c]));
+    const out = { revisados: 0, cambios: 0, activados: 0, rechazados: 0, protegidos: 0, sin_coincidencia: 0, errores: [] };
+    const carteras = new Map();
+    const { data: catalogo } = await getquery(pv.token, { query: 'comercializadoras' });
+    for (const cm of cms) {
+      const idAPI = cm.id_inergia_int ?? catalogo?.data?.find(c => String(c.nombre).toUpperCase() === String(cm.nombre).toUpperCase())?.idcomercializadora;
+      if (idAPI == null) continue;
       try {
-        const r = await sincronizarEstadoContrato(ct, pv);
+        const { status, data } = await getquery(pv.token, { query: 'cartera', idcomercializadora: idAPI });
+        if (status < 200 || status >= 300 || !Array.isArray(data?.data)) throw new Error('Respuesta de cartera inválida');
+        carteras.set(cm.id, data.data);
+        if (data.data.length === 300) out.errores.push(cm.nombre + ': 300 resultados; comprobar cobertura de API');
+      } catch (e) { out.errores.push(cm.nombre + ': ' + e.message); }
+    }
+    for (const ct of (cts || [])) {
+      if (ct.no_sync) { out.protegidos++; continue; }
+      try {
+        const row = coincidirContratoAPI(ct, clientes.get(ct.cliente_id), carteras.get(ct.comercializadora_id) || []);
+        if (!row) { out.sin_coincidencia++; continue; }
+        const upd = camposEstadoAPI(ct, row);
+        if (!upd) { out.errores.push(`CUPS ${ct.cups}: estado API desconocido`); continue; }
+        upd.id_inergia = Number(row.id);
+        const cambio = ct.estado !== upd.estado;
+        if (cambio && upd.estado === 'activado' && ct.comercial_cartera_id && ct.comision_calculada == null) {
+          const comision = await calcularComision({ ...ct, ...upd });
+          if (comision) upd.comision_calculada = comision.comision;
+        }
+        const material = Object.fromEntries(Object.entries(upd).filter(([key, value]) =>
+          key !== 'ultima_consulta_estado' && JSON.stringify(ct[key] ?? null) !== JSON.stringify(value ?? null)
+        ));
+        if (Object.keys(material).length) {
+          material.ultima_consulta_estado = upd.ultima_consulta_estado;
+          await db.upd('contratos', 'id=eq.' + ct.id + '&no_sync=not.is.true', material);
+        }
+        const r = { cambio, nuevoEstado: upd.estado, estadoTxt: row.estado, motivo: row.situacion };
         out.revisados++;
         if (r.cambio) {
           out.cambios++;
@@ -840,7 +857,8 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
       if (!productoId && prNombre) resultados.errores.push('Producto no encontrado: ' + f.producto + ' (CUPS: ' + f.cups + ')');
 
       // Estado
-      const estado = normalizarEstadoCRM(f.estado, 'activado');
+      const estado = normalizarEstadoCRM(f.estado);
+      if (!estado) { resultados.errores.push('Estado no reconocido: ' + f.estado + ' (CUPS: ' + f.cups + ')'); continue; }
       const cups   = String(f.cups||'').trim();
       const hoy    = new Date().toISOString().slice(0,10);
 
@@ -866,6 +884,7 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
         ? contratoActual(await db.sel('contratos', '&referencia=eq.' + encodeURIComponent(referencia) + '&comercializadora_id=eq.' + comercializadoraId))
         : null;
       if (ctMismoOrigen) {
+        if (ctMismoOrigen.no_sync) continue;
         await db.upd('contratos', 'id=eq.' + ctMismoOrigen.id, ctData);
         resultados.actualizados++;
       } else if (referencia) {
@@ -874,7 +893,7 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
         resultados.creados++;
       } else {
         const ctActual = contratoActual(await db.sel('contratos', '&cups=eq.' + encodeURIComponent(cups)));
-        if (ctActual) { await db.upd('contratos', 'id=eq.' + ctActual.id, ctData); resultados.actualizados++; }
+        if (ctActual) { if (ctActual.no_sync) continue; await db.upd('contratos', 'id=eq.' + ctActual.id, ctData); resultados.actualizados++; }
         else          { await db.ins('contratos', ctData); resultados.creados++; }
       }
     } catch (e) {
@@ -902,14 +921,7 @@ app.post('/api/webhooks/gana-energia', async (req, res) => {
     ? estadoPayload?.nombre || estadoPayload?.name || ''
     : String(estadoPayload || '');
   if (cups && estadoGana) {
-    const normalizado = estadoGana.trim().toLowerCase();
-    let estadoCRM = null;
-    if (normalizado === 'activo' || normalizado === 'activado') estadoCRM = 'activado';
-    else if (normalizado.startsWith('baja')) estadoCRM = 'baja';
-    else if (normalizado.startsWith('rechaz')) estadoCRM = 'rechazado';
-    else if (normalizado.startsWith('cancel')) estadoCRM = 'cancelado';
-    else if (normalizado.includes('incidencia')) estadoCRM = 'incidencia';
-    else if (/firmado|tramitado|aceptado|revisado|solicitud pendiente/.test(normalizado)) estadoCRM = 'en_tramite';
+    const estadoCRM = normalizarEstadoCRM(estadoGana);
 
     const ganaCms = await db.sel('comercializadoras', '&nombre=eq.GANA');
     const ganaCmIds = new Set((ganaCms || []).map(cm => cm.id));
