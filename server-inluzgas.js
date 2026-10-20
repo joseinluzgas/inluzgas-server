@@ -64,6 +64,25 @@ const db = {
 
 const log = (msg) => { console.log(`[${new Date().toLocaleTimeString('es-ES')}] ${msg}`); };
 
+// El CRM guarda un catálogo corto y estable. El texto literal del proveedor
+// se conserva aparte en estado_proveedor y, cuando aporta detalle, en situacion.
+const normalizarEstadoCRM = (valor, fallback = 'en_tramite') => {
+  const t = String(valor || '').trim().toLowerCase();
+  if (!t) return fallback;
+  if (/pdte\.?\s*renovar|pendiente.*renovar/.test(t)) return 'pdte_renovar';
+  if (/pdte\.?\s*grabar|pendiente.*grabar/.test(t)) return 'pdte_grabar';
+  if (/^activ/.test(t)) return 'activado';
+  if (/^baja/.test(t)) return 'baja';
+  if (/cancel|anulad/.test(t)) return 'cancelado';
+  if (/rechaz/.test(t)) return 'rechazado';
+  if (/incidencia resuelta/.test(t)) return 'en_tramite';
+  if (/incidenc/.test(t)) return 'incidencia';
+  if (/borrador/.test(t)) return 'borrador';
+  if (/enviado/.test(t)) return 'enviado';
+  if (/tr[aá]mite|pendiente|firma|nuevo|aceptado|revisado|solicitud/.test(t)) return 'en_tramite';
+  return fallback;
+};
+
 // Cuando un CUPS tiene varias contrataciones, la más reciente es la actual y
 // las anteriores se conservan como histórico. Nunca se actualiza en bloque el
 // histórico completo por una notificación del suministro.
@@ -416,8 +435,9 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           tipo: ct.suministro === 'GAS' ? 'gas' : 'luz',
           comercializadora_id: cm.id,
           producto_id: prodId,
-          estado: ct.estado || 'Activo',
-          situacion: ct.situacion || '',
+          estado: normalizarEstadoCRM(ct.estado, 'activado'),
+          estado_proveedor: ct.estado || null,
+          situacion: ct.situacion || ct.estado || '',
           codigo: ct.codigo || '',
           tarifa: ct.tarifa || '',
           potencia: String(ct.potencia1 || '0'),
@@ -508,12 +528,7 @@ app.get('/api/inergia/:proveedor/estadoctr/:id', async (req, res) => {
 // Mapea el texto de estado que devuelve iNergia al estado del CRM.
 // Devuelve null si no procede cambiar nada (en trámite / desconocido).
 function mapEstadoInergia(txt) {
-  const t = String(txt || '').toLowerCase();
-  if (/activ/.test(t))                    return 'activado';
-  if (/rechaz|anulad|incidenc/.test(t))   return 'rechazado';
-  if (/cancel/.test(t))                   return 'cancelado';
-  if (/baja/.test(t))                     return 'baja';
-  return null; // pendiente, en trámite, etc. → se mantiene "enviado"
+  return normalizarEstadoCRM(txt, null);
 }
 
 // Extrae estado y motivo del JSON de estadoctr sea cual sea su envoltorio
@@ -571,6 +586,7 @@ async function sincronizarEstadoContrato(ct, pv) {
   const nuevoEstado = mapEstadoInergia(estadoTxt);
 
   const upd = { estado_proveedor: estadoTxt || null, ultima_consulta_estado: new Date().toISOString() };
+  if (motivo || (!ct.situacion && estadoTxt)) upd.situacion = motivo || estadoTxt;
   let cambio = false;
   if (nuevoEstado && nuevoEstado !== ct.estado) {
     upd.estado = nuevoEstado;
@@ -824,8 +840,7 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
       if (!productoId && prNombre) resultados.errores.push('Producto no encontrado: ' + f.producto + ' (CUPS: ' + f.cups + ')');
 
       // Estado
-      const mapaEstado = { activo:'activado', baja:'baja', cancelado:'cancelado', pendiente:'enviado', rechazado:'rechazado' };
-      const estado = mapaEstado[String(f.estado||'').toLowerCase()] || 'activado';
+      const estado = normalizarEstadoCRM(f.estado, 'activado');
       const cups   = String(f.cups||'').trim();
       const hoy    = new Date().toISOString().slice(0,10);
 
@@ -903,7 +918,7 @@ app.post('/api/webhooks/gana-energia', async (req, res) => {
     const actual = contratoActual(versiones);
     if (actual && !actual.no_sync) {
       const hoy = new Date().toISOString().slice(0,10);
-      const upd = { estado_proveedor: estadoGana, ultima_consulta_estado: new Date().toISOString() };
+      const upd = { estado_proveedor: estadoGana, situacion: estadoGana, ultima_consulta_estado: new Date().toISOString() };
       if (estadoCRM) upd.estado = estadoCRM;
       // Una repetición del webhook nunca debe desplazar una fecha ya conocida.
       if (estadoCRM === 'activado' && !actual.fecha_activacion) {
