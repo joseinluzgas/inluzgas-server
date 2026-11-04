@@ -41,11 +41,19 @@ const sbFetch = async (path, opts = {}) => {
   return text ? JSON.parse(text) : null;
 };
 
-// PostgREST (Supabase) devuelve máx. 1000 filas por petición → paginamos con Range
+// PostgREST (Supabase) devuelve máx. 1000 filas por petición → paginamos con Range.
+// Cualquier orden recibido necesita `id` como desempate; sin él, filas con la
+// misma fecha pueden saltar o repetirse al cambiar de página.
+const normalizarFiltroPaginado = (f = '') => {
+  const match = f.match(/([?&])order=([^&]*)/);
+  if (!match) return f + '&order=id';
+  const campos = match[2].split(',').map(v => v.split('.')[0].trim());
+  if (campos.includes('id')) return f;
+  return f.replace(match[0], match[1] + 'order=' + match[2] + ',id');
+};
 const selPaginado = async (t, f = '') => {
   const PAG = 1000;
-  // Orden estable necesario para paginar; si la consulta no trae order, usamos id
-  const filtro = /(\?|&)order=/.test(f) ? f : f + '&order=id';
+  const filtro = normalizarFiltroPaginado(f);
   let out = [], desde = 0;
   for (;;) {
     const pag = await sbFetch(t + '?select=*' + filtro, { headers: { Range: desde + '-' + (desde + PAG - 1) } });
@@ -332,10 +340,10 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
       if (k && !cliPorId.has(k)) cliPorId.set(k, c.id);
     }
     const productos = await db.sel('productos');
-    const prodPorInergia = new Map();      // id_inergia_int -> uuid
+    const prodPorInergia = new Map();      // comercializadora_id:id_inergia_int -> uuid
     const sinEspPorCm = new Map();         // comercializadora_id -> uuid del 'SIN ESPECIFICAR'
     for (const p of productos) {
-      if (p.id_inergia_int != null) prodPorInergia.set(String(p.id_inergia_int), p.id);
+      if (p.id_inergia_int != null) prodPorInergia.set(p.comercializadora_id + ':' + p.id_inergia_int, p.id);
       if (String(p.nombre).toUpperCase() === 'SIN ESPECIFICAR') sinEspPorCm.set(p.comercializadora_id, p.id);
     }
     // Comercial por defecto para clientes nuevos: Laura, o el primer usuario disponible
@@ -356,7 +364,8 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
       return comercialDefecto;
     }
 
-    let creados = 0, actualizados = 0, saltados_novigente = 0, clientes_creados = 0, total = 0;
+    let creados = 0, actualizados = 0, registros_actualizados = 0, saltados_novigente = 0, clientes_creados = 0, total = 0;
+    let duplicados_coincidentes = 0, duplicados_protegidos = 0;
     const sinIdentificador = [];
     const erroresCli = [];
 
@@ -389,7 +398,7 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         total++;
         const estadoAPI = normalizarEstadoCRM(ct.estado);
         if (!estadoAPI) {
-          if (erroresCli.length < 50) erroresCli.push({ cups: ct.cups, motivo: 'Estado API desconocido; contrato conservado' });
+          if (erroresCli.length < 50) erroresCli.push({ referencia: ct.cups, cups: ct.cups, motivo: 'Estado API desconocido; contrato conservado' });
           continue;
         }
         const claveCli = norm(ct.cif);
@@ -403,15 +412,16 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
             const ins = await db.ins('clientes', nuevo);
             cliId = Array.isArray(ins) ? ins[0]?.id : ins?.id;
             if (cliId) { cliPorId.set(claveCli, cliId); clientes_creados++; }
-            else { if (erroresCli.length < 50) erroresCli.push({ cif: ct.cif, motivo: 'insert sin id' }); continue; }
+            else { if (erroresCli.length < 50) erroresCli.push({ referencia: ct.cif || ct.cups, cif: ct.cif, cups: ct.cups, motivo: 'insert sin id' }); continue; }
           } catch (e) {
-            if (erroresCli.length < 50) erroresCli.push({ cif: ct.cif, nombre: ct.nombre, motivo: e.message });
+            if (erroresCli.length < 50) erroresCli.push({ referencia: ct.cif || ct.cups, cif: ct.cif, cups: ct.cups, nombre: ct.nombre, motivo: e.message });
             continue;
           }
         }
-        // Producto: por idproducto si viene; si no, SIN ESPECIFICAR de la comercializadora
-        let prodId = ct.idproducto ? prodPorInergia.get(String(ct.idproducto)) : null;
-        if (!prodId) prodId = sinEspPorCm.get(cm.id);
+        // Para contratos nuevos, si la API no informa producto usamos el comodín.
+        // En contratos existentes, la ausencia de idproducto nunca borra un producto válido.
+        const productoApiId = ct.idproducto ? prodPorInergia.get(cm.id + ':' + ct.idproducto) : null;
+        const prodId = productoApiId || sinEspPorCm.get(cm.id);
         if (!prodId) continue; // no debería pasar si existe el SIN ESPECIFICAR
 
         // Resolver comercial por nombre de iNergia
@@ -454,19 +464,36 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           aclarador_cups: ct.aclarador_cups || ct.aclarador || '',
         };
         const coincidencias = candidatos.filter(c => coincidirContratoAPI(c, clientes.find(cl => cl.id === c.cliente_id), [ct]));
-        if (coincidencias.length === 1) {
-          const existente = coincidencias[0];
+        const actualizarExistente = async existente => {
           if (!existente.no_sync) {
             // Preserve cartera enrichment only after identifying the exact
             // contracting instance; never repurpose history for a renewal.
             const estadoData = { ...fila, ...camposEstadoAPI(existente, ct), id_inergia: Number(ct.id) };
+            if (!productoApiId) delete estadoData.producto_id;
             await db.upd('contratos', 'id=eq.' + existente.id + '&no_sync=not.is.true', estadoData);
-            actualizados++;
+            registros_actualizados++;
+            return true;
           }
+          return false;
+        };
+        if (coincidencias.length === 1) {
+          if (await actualizarExistente(coincidencias[0])) actualizados++;
         } else if (coincidencias.length > 1) {
-          if (erroresCli.length < 50) erroresCli.push({ cups: ct.cups, motivo: 'Varias contrataciones coincidentes; revisar duplicados' });
+          // Si todas las filas ya comparten el ID de esta contratación, son
+          // duplicados exactos del CRM: se conservan y se actualizan juntas.
+          const mismaContratacion = coincidencias.every(c => c.id_inergia != null && String(c.id_inergia) === String(ct.id));
+          if (mismaContratacion) {
+            let tocados = 0;
+            for (const existente of coincidencias) if (await actualizarExistente(existente)) tocados++;
+            if (tocados) actualizados++;
+            duplicados_coincidentes++;
+          } else if (coincidencias.every(c => c.no_sync)) {
+            duplicados_protegidos++;
+          } else if (erroresCli.length < 50) {
+            erroresCli.push({ referencia: ct.cups, cups: ct.cups, motivo: 'Varias contrataciones distintas coinciden; contrato conservado' });
+          }
         } else if (candidatos.some(c => c.id_inergia && String(c.id_inergia) === String(ct.id))) {
-          if (erroresCli.length < 50) erroresCli.push({ cups: ct.cups, motivo: 'ID API con identidad o fecha incompatible; contrato conservado' });
+          if (erroresCli.length < 50) erroresCli.push({ referencia: ct.cups, cups: ct.cups, motivo: 'ID API con identidad o fecha incompatible; contrato conservado' });
         } else if (['baja','cancelado','rechazado'].includes(estadoAPI)) {
           saltados_novigente++;
         } else {
@@ -477,9 +504,10 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
       }
     }
     await db.ins('eventos', { origen: nombre + ' · iNergia', tipo: 'sync.contratos', ref: '—',
-      detalle: `Cartera: ${total} · contratos creados ${creados} · actualizados ${actualizados} · clientes creados ${clientes_creados} · no vigentes ${saltados_novigente}${erroresCli.length ? ' · errores cliente ' + erroresCli.length : ''}` });
+      detalle: `Cartera: ${total} · contratos creados ${creados} · actualizados ${actualizados} (${registros_actualizados} filas) · clientes creados ${clientes_creados} · no vigentes ${saltados_novigente} · duplicados exactos ${duplicados_coincidentes}${erroresCli.length ? ' · incidencias ' + erroresCli.length : ''}` });
     log(`Sync contratos ${nombre}: ${creados} nuevos, ${actualizados} act, ${clientes_creados} clientes nuevos, ${saltados_novigente} no vig`);
-    res.json({ ok: true, total, creados, actualizados, clientes_creados, saltados_novigente, sinIdentificador, erroresCli });
+    res.json({ ok: true, total, creados, actualizados, registros_actualizados, clientes_creados, saltados_novigente,
+      duplicados_coincidentes, duplicados_protegidos, sinIdentificador, erroresCli });
   } catch (e) { res.status(502).json({ error: e.message }); }
 });
 

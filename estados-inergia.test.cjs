@@ -62,9 +62,15 @@ function server() {
     console:{log(){},warn(){}},process:{env:{}},URLSearchParams,fetch:()=>{throw new Error('Unexpected network');}};
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(__dirname+'/server-inluzgas.js','utf8')+
-    '\nglobalThis.harness={db,setQuery:fn=>{getquery=fn;},sincronizarEstadoContrato};',context);
+    '\nglobalThis.harness={db,setQuery:fn=>{getquery=fn;},sincronizarEstadoContrato,normalizarFiltroPaginado};',context);
   return {routes,...context.harness};
 }
+test('pagination always uses id as a stable tie breaker', () => {
+  const h=server();
+  assert.equal(h.normalizarFiltroPaginado(''), '&order=id');
+  assert.equal(h.normalizarFiltroPaginado('&order=created_at.desc'), '&order=created_at.desc,id');
+  assert.equal(h.normalizarFiltroPaginado('&estado=eq.activado&order=created_at.desc,id.desc'), '&estado=eq.activado&order=created_at.desc,id.desc');
+});
 test('bulk checks pending and active records, terminal transitions and no_sync', async () => {
   const h=server(), writes=[], filters=[];
   const records=[
@@ -125,4 +131,49 @@ test('cartera updates an existing termination and never repurposes history or pr
   assert.equal(writes[0].p.cliente_id,old.cliente_id);
   assert.equal(writes[0].p.comercial_cartera_id,undefined);
   assert.ok(inserts.every(i=>i.t==='eventos'));
+});
+test('cartera updates exact duplicate rows and preserves product when API omits it', async () => {
+  const h=server(), writes=[];
+  const duplicates=[
+    {...ct,id:'dup1',id_inergia:91,producto_id:'specific'},
+    {...ct,id:'dup2',id_inergia:91,producto_id:'specific'},
+  ];
+  h.db.sel=async(t)=>t==='proveedores'?[{id:'pv',token:'test',nombre:'SALUTARIS'}]:
+    t==='comercializadoras'?[{id:'cm',id_inergia_int:1,proveedor_id:'pv',nombre:'ENDESA'}]:
+    t==='contratos'?duplicates:t==='clientes'?[{...cliente,id:'cliente'}]:
+    t==='productos'?[{id:'specific',nombre:'PRODUCTO REAL',comercializadora_id:'cm'},{id:'fallback',nombre:'SIN ESPECIFICAR',comercializadora_id:'cm'}]:[];
+  h.db.upd=async(t,f,p)=>{writes.push({t,f,p});return [{id:f,...p}];};
+  h.db.ins=async()=>[];
+  h.setQuery(async()=>({status:200,data:{data:[row]}}));
+  let result;
+  await h.routes.get('POST /api/inergia/:proveedor/sincronizar-contratos')(
+    {params:{proveedor:'SALUTARIS'}},{json(d){result=d;},status(){return this;}});
+  assert.equal(result.ok,true);
+  assert.equal(result.actualizados,1);
+  assert.equal(result.registros_actualizados,2);
+  assert.equal(result.duplicados_coincidentes,1);
+  assert.equal(result.erroresCli.length,0);
+  assert.equal(writes.length,2);
+  assert.ok(writes.every(w=>w.p.producto_id===undefined));
+});
+test('product lookup is scoped to the contract commercializer', async () => {
+  const h=server(), writes=[];
+  const existing={...ct,id:'one',id_inergia:91,producto_id:'old'};
+  const incoming={...row,idproducto:159};
+  h.db.sel=async(t)=>t==='proveedores'?[{id:'pv',token:'test',nombre:'SALUTARIS'}]:
+    t==='comercializadoras'?[{id:'cm',id_inergia_int:1,proveedor_id:'pv',nombre:'ENDESA'}]:
+    t==='contratos'?[existing]:t==='clientes'?[{...cliente,id:'cliente'}]:t==='productos'?[
+      {id:'wrong',nombre:'RL.2 GAS ENDESA',comercializadora_id:'other',id_inergia_int:159},
+      {id:'correct',nombre:'RL.2 GAS ENDESA',comercializadora_id:'cm',id_inergia_int:159},
+      {id:'fallback',nombre:'SIN ESPECIFICAR',comercializadora_id:'cm'},
+    ]:[];
+  h.db.upd=async(t,f,p)=>{writes.push(p);return [{...existing,...p}];};
+  h.db.ins=async()=>[];
+  h.setQuery(async()=>({status:200,data:{data:[incoming]}}));
+  let result;
+  await h.routes.get('POST /api/inergia/:proveedor/sincronizar-contratos')(
+    {params:{proveedor:'SALUTARIS'}},{json(d){result=d;},status(){return this;}});
+  assert.equal(result.ok,true);
+  assert.equal(writes.length,1);
+  assert.equal(writes[0].producto_id,'correct');
 });
