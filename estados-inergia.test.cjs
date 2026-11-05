@@ -43,6 +43,13 @@ test('clears obsolete pending detail and uses actual activation dates', () => {
   assert.equal(patch.estado_original,undefined);
   assert.equal(camposEstadoAPI(ct,{estado:'Suspendido'}),null);
 });
+test('derives a missing annual renewal from activation without overwriting known dates', () => {
+  assert.equal(policy.fechaRenovacionAnual('2024-02-29'),'2025-02-28');
+  const missing=camposEstadoAPI({...ct,fecha_activacion:'2024-02-29'},{estado:'Activo'});
+  assert.equal(missing.fecha_renovacion,'2025-02-28');
+  const existing=camposEstadoAPI({...ct,fecha_activacion:'2024-02-29',fecha_renovacion:'2026-02-28'},{estado:'Activo'});
+  assert.equal(existing.fecha_renovacion,undefined);
+});
 test('never invents today as activation, renewal or termination date', () => {
   const p=camposEstadoAPI(ct,{estado:'Activo'});
   assert.equal(p.fecha_activacion,undefined);

@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const crypto  = require('crypto');
-const { normalizarEstadoCRM, coincidirContratoAPI, camposEstadoAPI } = require('./estados-inergia.cjs');
+const { normalizarEstadoCRM, coincidirContratoAPI, camposEstadoAPI, fechaRenovacionAnual } = require('./estados-inergia.cjs');
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -427,6 +427,7 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
         // Resolver comercial por nombre de iNergia
         const comercialId = resolverComercial(ct.comercial);
 
+        const fechaActivacion = ct.fecha_alta || null;
         const fila = {
           cliente_id: cliId,
           cups: ct.cups,
@@ -449,8 +450,8 @@ app.post('/api/inergia/:proveedor/sincronizar-contratos', async (req, res) => {
           comercial_import: ct.comercial ? String(ct.comercial).trim() : null,
           id_inergia: parseInt(ct.id) || null,
           iban: ct.iban || '',
-          fecha_activacion: ct.fecha_alta || null,
-          fecha_renovacion: ct.fecha_vto || null,
+          fecha_activacion: fechaActivacion,
+          fecha_renovacion: ct.fecha_vto || fechaRenovacionAnual(fechaActivacion),
           fecha_registro: ct.fecha_reg ? String(ct.fecha_reg).slice(0, 10) : null,
           fecha_baja: ct.fecha_baja || null,
           // Dirección del punto de suministro
@@ -891,6 +892,7 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
       const hoy    = new Date().toISOString().slice(0,10);
 
       const comercialCarteraId = resolverComercialExcel(f.comercial);
+      const fechaActivacion = estado==='activado' && f.alta ? new Date(f.alta).toISOString().slice(0,10) : null;
       const ctData = {
         cliente_id: clienteId, cups, tipo: prod?.tipo || (cups.startsWith('ES02')?'gas':'luz'),
         comercial_cartera_id: comercialCarteraId,
@@ -901,8 +903,8 @@ app.post('/api/importar/contratos-inergia', async (req, res) => {
         iban: String(f.iban||''), potencia_p1: parseFloat(f.potencia)||0,
         consumo_kwh: parseFloat(f.consumo)||null, referencia: String(f.codigo||''),
         fecha_registro: f.reg ? new Date(f.reg).toISOString().slice(0,10) : null,
-        fecha_activacion: estado==='activado' && f.alta ? new Date(f.alta).toISOString().slice(0,10) : null,
-        fecha_renovacion: f.vto ? new Date(f.vto).toISOString().slice(0,10) : null,
+        fecha_activacion: fechaActivacion,
+        fecha_renovacion: f.vto ? new Date(f.vto).toISOString().slice(0,10) : fechaRenovacionAnual(fechaActivacion),
         fecha_baja: estado==='baja' && f.fechaEstado ? new Date(f.fechaEstado).toISOString().slice(0,10) : null,
         pagador: parseInt(f.pag)||1, tiposol:'C1',
       };
@@ -960,14 +962,13 @@ app.post('/api/webhooks/gana-energia', async (req, res) => {
       const hoy = new Date().toISOString().slice(0,10);
       const upd = { estado_proveedor: estadoGana, situacion: estadoGana, ultima_consulta_estado: new Date().toISOString() };
       if (estadoCRM) upd.estado = estadoCRM;
-      // Una repetición del webhook nunca debe desplazar una fecha ya conocida.
-      if (estadoCRM === 'activado' && !actual.fecha_activacion) {
-        const fechaActivacion = ev.fecha_activacion || ev.fechaAlta || ev.fecha_alta || hoy;
-        upd.fecha_activacion = String(fechaActivacion).slice(0, 10);
+      // Una repetición del webhook nunca desplaza fechas conocidas, pero sí
+      // completa la renovación cuando GANA solo informó la activación.
+      if (estadoCRM === 'activado') {
+        const fechaActivacion = String(actual.fecha_activacion || ev.fecha_activacion || ev.fechaAlta || ev.fecha_alta || hoy).slice(0, 10);
+        if (!actual.fecha_activacion) upd.fecha_activacion = fechaActivacion;
         if (!actual.fecha_renovacion) {
-          const d = new Date(upd.fecha_activacion + 'T00:00:00');
-          d.setMonth(d.getMonth() + (Number(actual.duracion_meses) || 12));
-          upd.fecha_renovacion = d.toISOString().slice(0, 10);
+          upd.fecha_renovacion = String(ev.fecha_renovacion || ev.fechaRenovacion || ev.fecha_vto || fechaRenovacionAnual(fechaActivacion)).slice(0, 10);
         }
       }
       if (estadoCRM === 'baja' && !actual.fecha_baja) {

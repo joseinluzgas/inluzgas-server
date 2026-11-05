@@ -28,6 +28,14 @@ function fechaAPI(v) {
   const date = new Date(text + 'T00:00:00Z');
   return Number.isFinite(date.getTime()) && date.toISOString().slice(0,10) === text ? text : null;
 }
+function fechaRenovacionAnual(fechaActivacion) {
+  const value = fechaAPI(fechaActivacion);
+  if (!value) return null;
+  const [year, month, day] = value.split('-').map(Number);
+  const targetYear = year + 1;
+  const lastDay = new Date(Date.UTC(targetYear, month, 0)).getUTCDate();
+  return `${targetYear}-${String(month).padStart(2,'0')}-${String(Math.min(day,lastDay)).padStart(2,'0')}`;
+}
 function parseEstadoCtr(data) {
   const d = Array.isArray(data) ? data[0] : Array.isArray(data?.data) ? data.data[0] : (data?.data || data || {});
   const estadoTxt = d?.estado ?? d?.Estado ?? d?.estado_contrato ?? d?.status ?? '';
@@ -60,10 +68,14 @@ function camposEstadoAPI(ct, row, now = new Date().toISOString()) {
     if (value) upd[dst] = value;
   }
   if (estado === 'activado') {
+    const activation = upd.fecha_activacion || fechaAPI(ct.fecha_activacion);
+    if (!upd.fecha_renovacion && !fechaAPI(ct.fecha_renovacion) && activation) {
+      upd.fecha_renovacion = fechaRenovacionAnual(activation);
+    }
     if (Object.hasOwn(row,'fecha_baja') && !row.fecha_baja) upd.fecha_baja = null;
     upd.motivo_rechazo = null;
   }
   if (estado === 'rechazado') upd.motivo_rechazo = String(row.motivo || row.situacion || row.estado);
   return upd;
 }
-module.exports = { CANONICOS, normalizarEstadoCRM, cupsBase, fechaAPI, parseEstadoCtr, coincidirContratoAPI, camposEstadoAPI };
+module.exports = { CANONICOS, normalizarEstadoCRM, cupsBase, fechaAPI, fechaRenovacionAnual, parseEstadoCtr, coincidirContratoAPI, camposEstadoAPI };
