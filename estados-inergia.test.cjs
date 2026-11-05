@@ -32,16 +32,22 @@ test('retains history when the same CUPS has a renewal', () => {
   assert.equal(coincidirContratoAPI({...ct,fecha_registro:'2025-09-30'},cliente,[row,old]),old);
   assert.equal(coincidirContratoAPI(ct,cliente,[row,old]),row);
 });
-test('clears obsolete pending detail and uses actual activation dates', () => {
+test('keeps the provider state as situation when no detailed situation exists', () => {
   const patch=camposEstadoAPI({...ct,fecha_baja:'2024-01-01'},row,'2026-10-20T12:00:00Z');
   assert.equal(patch.estado,'activado');
-  assert.equal(patch.situacion,'');
+  assert.equal(patch.situacion,'Activo');
   assert.equal(patch.fecha_activacion,'2026-10-06');
   assert.equal(patch.fecha_renovacion,'2027-10-06');
   assert.equal(patch.fecha_baja,null);
   assert.equal(patch.comercial_cartera_id,undefined);
   assert.equal(patch.estado_original,undefined);
   assert.equal(camposEstadoAPI(ct,{estado:'Suspendido'}),null);
+});
+test('maps Nuevo to en tramite and preserves Nuevo as its visible situation', () => {
+  const patch=camposEstadoAPI(ct,{estado:'Nuevo',situacion:''});
+  assert.equal(patch.estado,'en_tramite');
+  assert.equal(patch.estado_proveedor,'Nuevo');
+  assert.equal(patch.situacion,'Nuevo');
 });
 test('derives a missing annual renewal from activation without overwriting known dates', () => {
   assert.equal(policy.fechaRenovacionAnual('2024-02-29'),'2025-02-28');

@@ -61,7 +61,9 @@ function camposEstadoAPI(ct, row, now = new Date().toISOString()) {
   const estado = normalizarEstadoCRM(row.estado);
   if (!estado) return null; // Unknown is not evidence of activation.
   const upd = { estado, estado_proveedor: String(row.estado), ultima_consulta_estado: now };
-  if (Object.hasOwn(row, 'situacion')) upd.situacion = String(row.situacion ?? '');
+  const situacionProveedor = Object.hasOwn(row, 'situacion') ? String(row.situacion ?? '').trim() : '';
+  if (situacionProveedor) upd.situacion = situacionProveedor;
+  else if (row.estado) upd.situacion = String(row.estado).trim();
   else if (estado !== normalizarEstadoCRM(ct.estado)) upd.situacion = '';
   for (const [src,dst] of [['fecha_alta','fecha_activacion'],['fecha_vto','fecha_renovacion'],['fecha_baja','fecha_baja']]) {
     const value = fechaAPI(row[src]);
