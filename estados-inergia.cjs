@@ -1,4 +1,4 @@
-const CANONICOS = new Set(['borrador','enviado','en_tramite','activado','pdte_renovar','pdte_grabar','incidencia','rechazado','baja','cancelado']);
+const CANONICOS = new Set(['borrador','enviado','en_tramite','activado','comisionado','pdte_renovar','pdte_grabar','incidencia','rechazado','baja','cancelado']);
 function normalizarEstadoCRM(valor, fallback = null) {
   const raw = String(valor ?? '').trim().toLowerCase();
   if (CANONICOS.has(raw)) return raw;
@@ -9,7 +9,8 @@ function normalizarEstadoCRM(valor, fallback = null) {
   if (/rechaz/.test(t) || t === 'ko') return 'rechazado';
   if (/incidencia resuelta/.test(t)) return 'en_tramite';
   if (/incidenc/.test(t)) return 'incidencia';
-  if (/^(activo|activado)(\s+ftr)?$/.test(t) || t === 'comisionado') return 'activado';
+  if (t === 'comisionado') return 'comisionado';
+  if (/^(activo|activado)(\s+ftr)?$/.test(t)) return 'activado';
   if (/^(pdte|pendiente).*renovar/.test(t)) return 'pdte_renovar';
   if (/^(pdte|pendiente).*grabar|^grabar a futuro$/.test(t)) return 'pdte_grabar';
   if (t === 'borrador') return 'borrador';
@@ -58,8 +59,13 @@ function coincidirContratoAPI(ct, cliente, rows) {
   return alta.length === 1 ? alta[0] : null;
 }
 function camposEstadoAPI(ct, row, now = new Date().toISOString()) {
-  const estado = normalizarEstadoCRM(row.estado);
-  if (!estado) return null; // Unknown is not evidence of activation.
+  const estadoProveedor = normalizarEstadoCRM(row.estado);
+  if (!estadoProveedor) return null; // Unknown is not evidence of activation.
+  // "Comisionado" es un estado interno. Una respuesta posterior del proveedor
+  // que siga diciendo "activado" no debe deshacer la liquidación confirmada.
+  const estado = estadoProveedor === 'activado' && normalizarEstadoCRM(ct.estado) === 'comisionado'
+    ? 'comisionado'
+    : estadoProveedor;
   const upd = { estado, estado_proveedor: String(row.estado), ultima_consulta_estado: now };
   const situacionProveedor = Object.hasOwn(row, 'situacion') ? String(row.situacion ?? '').trim() : '';
   if (situacionProveedor) upd.situacion = situacionProveedor;
@@ -69,7 +75,7 @@ function camposEstadoAPI(ct, row, now = new Date().toISOString()) {
     const value = fechaAPI(row[src]);
     if (value) upd[dst] = value;
   }
-  if (estado === 'activado') {
+  if (estado === 'activado' || estado === 'comisionado') {
     const activation = upd.fecha_activacion || fechaAPI(ct.fecha_activacion);
     if (!upd.fecha_renovacion && !fechaAPI(ct.fecha_renovacion) && activation) {
       upd.fecha_renovacion = fechaRenovacionAnual(activation);

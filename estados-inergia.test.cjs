@@ -43,6 +43,13 @@ test('keeps the provider state as situation when no detailed situation exists', 
   assert.equal(patch.estado_original,undefined);
   assert.equal(camposEstadoAPI(ct,{estado:'Suspendido'}),null);
 });
+test('preserves an internally commissioned contract while the provider still reports active', () => {
+  const patch=camposEstadoAPI({...ct,estado:'comisionado',fecha_comisionado:'2026-11-06'},row,'2026-11-07T12:00:00Z');
+  assert.equal(patch.estado,'comisionado');
+  assert.equal(patch.estado_proveedor,'Activo');
+  assert.equal(patch.fecha_comisionado,undefined);
+  assert.equal(camposEstadoAPI({...ct,estado:'comisionado'},{...row,estado:'Baja'}).estado,'baja');
+});
 test('maps Nuevo to en tramite and preserves Nuevo as its visible situation', () => {
   const patch=camposEstadoAPI(ct,{estado:'Nuevo',situacion:''});
   assert.equal(patch.estado,'en_tramite');
